@@ -1,6 +1,95 @@
 import { useEffect, useRef, useState } from "react";
 import styled from "styled-components";
 
+// Shader source code
+const computeShaderSource = `#version 300 es
+precision highp float;
+
+uniform sampler2D u_texture;
+uniform vec2 u_resolution;
+uniform float u_dA;
+uniform float u_dB;
+uniform float u_feed;
+uniform float u_kill;
+uniform float u_feedDiff;
+uniform float u_feedVariation;
+
+out vec4 fragColor;
+
+void main() {
+    vec2 texelSize = 1.0 / u_resolution;
+    vec2 uv = gl_FragCoord.xy / u_resolution;
+    
+    // Get the current cell values
+    vec4 cell = texture(u_texture, uv);
+    float A = cell.r;
+    float B = cell.g;
+    
+    // Calculate feed rate with variation
+    float feedRate = u_feed + ((u_feedVariation - 50.0) * u_feedDiff) / 100.0;
+    float killRate = u_kill;
+    
+    // Calculate Laplacian
+    float laplaceA = 0.0;
+    float laplaceB = 0.0;
+    
+    // 3x3 Laplace kernel
+    for(int y = -1; y <= 1; y++) {
+        for(int x = -1; x <= 1; x++) {
+            vec2 offset = vec2(float(x), float(y)) * texelSize;
+            vec4 neighbor = texture(u_texture, uv + offset);
+            
+            float weight = 0.05;
+            if(x == 0 || y == 0) weight = 0.2;
+            if(x == 0 && y == 0) weight = -1.0;
+            
+            laplaceA += neighbor.r * weight;
+            laplaceB += neighbor.g * weight;
+        }
+    }
+    
+    // Reaction-diffusion equations
+    float nextA = A + (u_dA * laplaceA - A * B * B + feedRate * (1.0 - A));
+    float nextB = B + (u_dB * laplaceB + A * B * B - (feedRate + killRate) * B);
+    
+    // Clamp values
+    nextA = clamp(nextA, 0.0, 1.0);
+    nextB = clamp(nextB, 0.0, 1.0);
+    
+    fragColor = vec4(nextA, nextB, 0.0, 1.0);
+}
+`;
+
+const renderShaderSource = `#version 300 es
+precision highp float;
+
+in vec2 v_texCoord;
+uniform sampler2D u_texture;
+uniform float u_threshold;
+uniform float u_sharpness;
+
+out vec4 fragColor;
+
+void main() {
+    vec4 color = texture(u_texture, v_texCoord);
+    float gs = color.r;
+    float gs_map = (gs - u_threshold) / (0.9 - u_threshold);
+    float sharp = pow(clamp(gs_map, 0.0, 1.0), u_sharpness);
+    fragColor = vec4(vec3(sharp), 1.0);
+}
+`;
+
+const vertexShaderSource = `#version 300 es
+in vec4 a_position;
+in vec2 a_texCoord;
+out vec2 v_texCoord;
+
+void main() {
+    gl_Position = a_position;
+    v_texCoord = a_texCoord;
+}
+`;
+
 const Container = styled.div`
   padding: 20px;
 `;
@@ -79,11 +168,51 @@ const Value = styled.span`
   text-align: right;
 `;
 
+const createShader = (gl: WebGL2RenderingContext, type: number, source: string) => {
+  const shader = gl.createShader(type);
+  if (!shader) throw new Error("Failed to create shader");
+
+  gl.shaderSource(shader, source);
+  gl.compileShader(shader);
+
+  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+    const info = gl.getShaderInfoLog(shader);
+    gl.deleteShader(shader);
+    throw new Error(`Shader compilation error: ${info}`);
+  }
+
+  return shader;
+};
+
+const createProgram = (
+  gl: WebGL2RenderingContext,
+  vertexShader: WebGLShader,
+  fragmentShader: WebGLShader
+) => {
+  const program = gl.createProgram();
+  if (!program) throw new Error("Failed to create program");
+
+  gl.attachShader(program, vertexShader);
+  gl.attachShader(program, fragmentShader);
+  gl.linkProgram(program);
+
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    const info = gl.getProgramInfoLog(program);
+    gl.deleteProgram(program);
+    throw new Error(`Program link error: ${info}`);
+  }
+
+  return program;
+};
+
 const DiffusionPatternRenderer = () => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const currentGridRef = useRef<Float32Array | null>(null);
-  const nextGridRef = useRef<Float32Array | null>(null);
-  const [isRunning, setIsRunning] = useState<boolean>(false);
+  const glRef = useRef<WebGL2RenderingContext | null>(null);
+  const texturesRef = useRef<WebGLTexture[]>([]);
+  const framebuffersRef = useRef<WebGLFramebuffer[]>([]);
+  const computeProgramRef = useRef<WebGLProgram | null>(null);
+  const renderProgramRef = useRef<WebGLProgram | null>(null);
+  const [isRunning, setIsRunning] = useState(false);
   const [params, setParams] = useState({
     dA: 1.0,
     dB: 0.5,
@@ -97,17 +226,16 @@ const DiffusionPatternRenderer = () => {
     threshold: 0.5,
   });
 
-  const initGrid = () => {
-    if (!canvasRef.current) return;
-    const { width, height } = canvasRef.current;
-
-    currentGridRef.current = new Float32Array(width * height * 2);
-    nextGridRef.current = new Float32Array(width * height * 2);
+  const initializeTexture = (gl: WebGL2RenderingContext, texture: WebGLTexture) => {
+    const { width, height } = gl.canvas;
+    const initialState = new Float32Array(width * height * 4);
 
     // Initialize with chemical A
-    for (let i = 0; i < currentGridRef.current.length; i += 2) {
-      currentGridRef.current[i] = 1;
-      currentGridRef.current[i + 1] = 0;
+    for (let i = 0; i < initialState.length; i += 4) {
+      initialState[i] = 1; // A (red channel)
+      initialState[i + 1] = 0; // B (green channel)
+      initialState[i + 2] = 0; // unused
+      initialState[i + 3] = 1; // alpha
     }
 
     // Add random spots of chemical B
@@ -118,126 +246,235 @@ const DiffusionPatternRenderer = () => {
 
       for (let dy = -radius; dy <= radius; dy++) {
         for (let dx = -radius; dx <= radius; dx++) {
-          const px = (x + dx + width) % width;
-          const py = (y + dy + height) % height;
           if (dx * dx + dy * dy <= radius * radius) {
-            const idx = (py * width + px) * 2;
-            if (currentGridRef.current) {
-              currentGridRef.current[idx] = 0;
-              currentGridRef.current[idx + 1] = 1;
-            }
+            const px = (x + dx + width) % width;
+            const py = (y + dy + height) % height;
+            const idx = (py * width + px) * 4;
+            initialState[idx] = 0; // A
+            initialState[idx + 1] = 1; // B
           }
         }
       }
     }
+
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, width, height, 0, gl.RGBA, gl.FLOAT, initialState);
   };
 
-  const resetSimulation = () => {
+  const initWebGL = () => {
     if (!canvasRef.current) return;
-    currentGridRef.current = null;
-    nextGridRef.current = null;
-    const ctx = canvasRef.current.getContext("2d");
-    initGrid();
-    if (ctx) render(ctx);
+
+    const gl = canvasRef.current.getContext("webgl2", { preserveDrawingBuffer: true });
+    if (!gl) throw new Error("WebGL 2 not supported");
+
+    // Check for floating point texture support
+    const ext = gl.getExtension('EXT_color_buffer_float');
+    if (!ext) {
+      throw new Error('Floating point textures not supported');
+    }
+
+    glRef.current = gl;
+
+    // Create compute program
+    const computeVertexShader = createShader(gl, gl.VERTEX_SHADER, vertexShaderSource);
+    const computeFragmentShader = createShader(gl, gl.FRAGMENT_SHADER, computeShaderSource);
+    computeProgramRef.current = createProgram(gl, computeVertexShader, computeFragmentShader);
+
+    // Create render program
+    const renderVertexShader = createShader(gl, gl.VERTEX_SHADER, vertexShaderSource);
+    const renderFragmentShader = createShader(gl, gl.FRAGMENT_SHADER, renderShaderSource);
+    renderProgramRef.current = createProgram(gl, renderVertexShader, renderFragmentShader);
+
+    // Create vertex buffer
+    const vertices = new Float32Array([
+      -1, -1,  0, 0,
+       1, -1,  1, 0,
+      -1,  1,  0, 1,
+      -1,  1,  0, 1,
+       1, -1,  1, 0,
+       1,  1,  1, 1,
+    ]);
+
+    const vertexBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, vertexBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STATIC_DRAW);
+
+    // Set up vertex attributes for both programs
+    [computeProgramRef.current, renderProgramRef.current].forEach(program => {
+      gl.useProgram(program);
+      
+      const positionLoc = gl.getAttribLocation(program, 'a_position');
+      const texCoordLoc = gl.getAttribLocation(program, 'a_texCoord');
+      
+      gl.enableVertexAttribArray(positionLoc);
+      gl.enableVertexAttribArray(texCoordLoc);
+      
+      gl.vertexAttribPointer(positionLoc, 2, gl.FLOAT, false, 16, 0);
+      gl.vertexAttribPointer(texCoordLoc, 2, gl.FLOAT, false, 16, 8);
+    });
+
+    // Create textures and framebuffers
+    texturesRef.current = [];
+    framebuffersRef.current = [];
+
+    for (let i = 0; i < 2; i++) {
+      const texture = gl.createTexture();
+      if (!texture) throw new Error("Failed to create texture");
+
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+      gl.texImage2D(
+        gl.TEXTURE_2D,
+        0,
+        gl.RGBA32F,
+        gl.canvas.width,
+        gl.canvas.height,
+        0,
+        gl.RGBA,
+        gl.FLOAT,
+        null
+      );
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+
+      const fb = gl.createFramebuffer();
+      if (!fb) throw new Error("Failed to create framebuffer");
+
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
+
+      const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+      if (status !== gl.FRAMEBUFFER_COMPLETE) {
+        throw new Error(`Framebuffer is not complete: ${status}`);
+      }
+
+      texturesRef.current.push(texture);
+      framebuffersRef.current.push(fb);
+    }
+
+    // Initialize the first texture
+    initializeTexture(gl, texturesRef.current[0]);
+
+    // Set viewport
+    gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
   };
 
   const computeStep = () => {
-    if (!canvasRef.current || !currentGridRef.current || !nextGridRef.current) return;
+    const gl = glRef.current;
+    if (!gl || !computeProgramRef.current) return;
 
-    const { width, height } = canvasRef.current;
+    gl.useProgram(computeProgramRef.current);
 
-    for (let y = 0; y < height; y++) {
-      for (let x = 0; x < width; x++) {
-        const i = (y * width + x) * 2;
+    // Set uniforms
+    const uniforms = {
+      u_texture: 0,
+      u_resolution: [gl.canvas.width, gl.canvas.height],
+      u_dA: params.dA,
+      u_dB: params.dB,
+      u_feed: params.feed,
+      u_kill: params.killMin,
+      u_feedDiff: params.feedDiff,
+      u_feedVariation: params.feedVariation,
+    };
 
-        const normalizedX = x / width;
-        const feedRate = params.feed + ((params.feedVariation - 50) * params.feedDiff) / 100;
-        const killRate = params.killMin + normalizedX * (params.killMax - params.killMin);
-
-        let laplaceA = 0;
-        let laplaceB = 0;
-
-        for (let dy = -1; dy <= 1; dy++) {
-          for (let dx = -1; dx <= 1; dx++) {
-            const px = (x + dx + width) % width;
-            const py = (y + dy + height) % height;
-            const idx = (py * width + px) * 2;
-
-            let weight = 0.05;
-            if (dx === 0 || dy === 0) weight = 0.2;
-            if (dx === 0 && dy === 0) weight = -1.0;
-
-            laplaceA += currentGridRef.current[idx] * weight;
-            laplaceB += currentGridRef.current[idx + 1] * weight;
-          }
+    Object.entries(uniforms).forEach(([name, value]) => {
+      const location = gl.getUniformLocation(computeProgramRef.current!, name);
+      if (location) {
+        if (Array.isArray(value)) {
+          gl.uniform2fv(location, value);
+        } else if (name === 'u_texture') {
+          gl.uniform1i(location, value);
+        } else {
+          gl.uniform1f(location, value);
         }
-
-        const a = currentGridRef.current[i];
-        const b = currentGridRef.current[i + 1];
-
-        nextGridRef.current[i] = a + (laplaceA * params.dA - a * b * b + feedRate * (1 - a));
-        nextGridRef.current[i + 1] =
-          b + (laplaceB * params.dB + a * b * b - (feedRate + killRate) * b);
-
-        nextGridRef.current[i] = Math.max(0, Math.min(1, nextGridRef.current[i]));
-        nextGridRef.current[i + 1] = Math.max(0, Math.min(1, nextGridRef.current[i + 1]));
       }
-    }
+    });
 
-    // Swap buffers
-    const temp = currentGridRef.current;
-    currentGridRef.current = nextGridRef.current;
-    nextGridRef.current = temp;
+    // Ping-pong between textures
+    for (let i = 0; i < params.iterations; i++) {
+      const readIdx = i % 2;
+      const writeIdx = (i + 1) % 2;
+
+      gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffersRef.current[writeIdx]);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, texturesRef.current[readIdx]);
+
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+    }
   };
 
-  const render = (ctx: CanvasRenderingContext2D) => {
-    if (!currentGridRef.current) return;
+  const render = () => {
+    const gl = glRef.current;
+    if (!gl || !renderProgramRef.current) return;
 
-    const { width, height } = ctx.canvas;
-    const imageData = ctx.createImageData(width, height);
+    gl.useProgram(renderProgramRef.current);
 
-    for (let i = 0; i < currentGridRef.current.length; i += 2) {
-      const idx = i * 2;
-      const a = currentGridRef.current[i];
-      const gs = a;
-      const gs_map = (gs - params.threshold) / (0.9 - params.threshold);
-      const sharpValue = Math.pow(Math.max(0, Math.min(1, gs_map)), params.sharpness);
-      const final = Math.round(sharpValue * 255);
+    // Set uniforms for render shader
+    const texLocation = gl.getUniformLocation(renderProgramRef.current, "u_texture");
+    gl.uniform1i(texLocation, 0);
+    
+    gl.uniform1f(gl.getUniformLocation(renderProgramRef.current, "u_threshold"), params.threshold);
+    gl.uniform1f(gl.getUniformLocation(renderProgramRef.current, "u_sharpness"), params.sharpness);
 
-      imageData.data[idx] = final;
-      imageData.data[idx + 1] = final;
-      imageData.data[idx + 2] = final;
-      imageData.data[idx + 3] = 255;
-    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, texturesRef.current[(params.iterations + 1) % 2]);
 
-    ctx.putImageData(imageData, 0, 0);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+  };
+
+
+  const resetSimulation = () => {
+    const gl = glRef.current;
+    if (!gl || texturesRef.current.length === 0) return;
+
+    // Stop the simulation
+    setIsRunning(false);
+
+    // Reset the first texture with new random initial state
+    initializeTexture(gl, texturesRef.current[0]);
+
+    // Clear the second texture
+    gl.bindTexture(gl.TEXTURE_2D, texturesRef.current[1]);
+    gl.texImage2D(
+      gl.TEXTURE_2D,
+      0,
+      gl.RGBA32F,
+      gl.canvas.width,
+      gl.canvas.height,
+      0,
+      gl.RGBA,
+      gl.FLOAT,
+      null
+    );
+
+    // Render the initial state
+    render();
   };
 
   useEffect(() => {
     if (!canvasRef.current) return;
 
-    let animationFrame: number;
-    const canvas = canvasRef.current;
-    const ctx = canvas.getContext("2d");
+    canvasRef.current.width = 400;
+    canvasRef.current.height = 400;
 
-    canvas.width = 400;
-    canvas.height = 400;
-
-    if (!currentGridRef.current) {
-      initGrid();
+    try {
+      initWebGL();
+    } catch (error) {
+      console.error("WebGL initialization failed:", error);
+      return;
     }
 
+    let animationFrame: number;
+
     const update = () => {
-      if (isRunning && ctx) {
-        for (let i = 0; i < params.iterations; i++) {
-          computeStep();
-        }
-        render(ctx);
+      if (isRunning) {
+        computeStep();
+        render();
         animationFrame = requestAnimationFrame(update);
       }
     };
-
-    if (ctx) render(ctx);
 
     if (isRunning) {
       update();
@@ -278,9 +515,9 @@ const DiffusionPatternRenderer = () => {
             } else if (key === "dA" || key === "dB") {
               max = "2";
             } else if (key === "sharpness") {
-              min = "0.1";
-              max = "5";
-              step = "0.1";
+              min = "0.01";
+              max = "1";
+              step = "0.05";
             } else if (key === "threshold") {
               min = "0";
               max = "0.9";
