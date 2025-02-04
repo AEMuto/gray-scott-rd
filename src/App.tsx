@@ -90,84 +90,6 @@ void main() {
 }
 `;
 
-const Container = styled.div`
-  padding: 20px;
-`;
-
-const Canvas = styled.canvas`
-  border: 1px solid #ccc;
-  border-radius: 4px;
-`;
-
-const Controls = styled.div`
-  margin-top: 20px;
-  display: flex;
-  flex-direction: column;
-  gap: 20px;
-`;
-
-const ButtonGroup = styled.div`
-  display: flex;
-  gap: 16px;
-  align-items: center;
-`;
-
-const Button = styled.button`
-  padding: 8px 16px;
-  border-radius: 4px;
-  border: none;
-  cursor: pointer;
-  font-size: 14px;
-  transition: background-color 0.2s;
-
-  &:hover {
-    opacity: 0.9;
-  }
-`;
-
-const StartButton = styled(Button)`
-  background-color: #3b82f6;
-  color: white;
-
-  &:hover {
-    background-color: #2563eb;
-  }
-`;
-
-const ResetButton = styled(Button)`
-  background-color: #6b7280;
-  color: white;
-
-  &:hover {
-    background-color: #4b5563;
-  }
-`;
-
-const ParameterControls = styled.div`
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-`;
-
-const ParameterRow = styled.div`
-  display: flex;
-  align-items: center;
-  gap: 8px;
-`;
-
-const Label = styled.label`
-  width: 120px;
-`;
-
-const Range = styled.input`
-  flex: 1;
-`;
-
-const Value = styled.span`
-  width: 60px;
-  text-align: right;
-`;
-
 const createShader = (gl: WebGL2RenderingContext, type: number, source: string) => {
   const shader = gl.createShader(type);
   if (!shader) throw new Error("Failed to create shader");
@@ -553,3 +475,83 @@ const DiffusionPatternRenderer = () => {
 };
 
 export default DiffusionPatternRenderer;
+
+const Container = styled.div`
+  padding: 20px;
+  border: solid 1px #ccc;
+  border-radius: .5rem;
+`;
+
+const Canvas = styled.canvas`
+  border: 1px solid #ccc;
+  border-radius: 4px;
+`;
+
+const Controls = styled.div`
+  margin-top: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+`;
+
+const ButtonGroup = styled.div`
+  display: flex;
+  gap: 16px;
+  align-items: center;
+`;
+
+const Button = styled.button`
+  padding: 8px 16px;
+  border-radius: 4px;
+  border: none;
+  cursor: pointer;
+  font-size: 14px;
+  transition: background-color 0.2s;
+
+  &:hover {
+    opacity: 0.9;
+  }
+`;
+
+const StartButton = styled(Button)`
+  background-color: #3b82f6;
+  color: white;
+
+  &:hover {
+    background-color: #2563eb;
+  }
+`;
+
+const ResetButton = styled(Button)`
+  background-color: #6b7280;
+  color: white;
+
+  &:hover {
+    background-color: #4b5563;
+  }
+`;
+
+const ParameterControls = styled.div`
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+`;
+
+const ParameterRow = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 8px;
+`;
+
+const Label = styled.label`
+  width: 120px;
+`;
+
+const Range = styled.input`
+  flex: 1;
+`;
+
+const Value = styled.span`
+  width: 60px;
+  text-align: right;
+`;
